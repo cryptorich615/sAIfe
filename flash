@@ -1,1 +1,158 @@
+from flashbots import flashbot
+from eth_account.account import Account
+from eth_account.signers.local import LocalAccount
+from web3 import Web3, exceptions
+from web3.middleware import construct_sign_and_send_raw_middleware
+import os
+import json
 
+# ======================
+# CONFIGURATION
+# ======================
+NETWORK_CONFIG = {
+    "ethereum": {
+        "rpc": os.getenv("ETH_RPC_URL"),
+        "flashbots_relay": "https://relay.flashbots.net",
+        "chain_id": 1,
+        "eip1559": True
+    },
+    "polygon": {
+        "rpc": os.getenv("POLYGON_RPC_URL"),
+        "flashbots_relay": "https://relay.flashbots.net",
+        "chain_id": 137,
+        "eip1559": False
+    },
+    "bsc": {
+        "rpc": os.getenv("BSC_RPC_URL"),
+        "flashbots_relay": "https://relay.flashbots.net",
+        "chain_id": 56,
+        "eip1559": False
+    }
+}
+
+TOKEN_STANDARDS = {
+    "ERC20": {
+        "transfer": "0xa9059cbb",
+        "balance": "0x70a08231"
+    },
+    "ERC721": {
+        "safeTransferFrom": "0x42842e0e"
+    },
+    "ERC1155": {
+        "safeTransferFrom": "0xf242432a"
+    }
+}
+
+# ======================
+# INITIALIZATION
+# ======================
+def setup_web3(network):
+    config = NETWORK_CONFIG[network]
+    w3 = Web3(Web3.HTTPProvider(config["rpc"]))
+    flashbot(w3, config["flashbots_relay"])
+    w3.middleware_onion.add(construct_sign_and_send_raw_middleware(sponsor))
+    return w3, config
+
+# ======================
+# TOKEN OPERATIONS
+# ======================
+def generate_transfer_data(token_type, params):
+    if token_type == "ERC20":
+        return TOKEN_STANDARDS["ERC20"]["transfer"] + \
+            Web3.to_hex(Web3.to_bytes(hexstr=params["to"]).rjust(32, b'\0'))[2:] + \
+            Web3.to_hex(Web3.to_bytes(params["amount"]).rjust(32, b'\0'))[2:]
+    
+    elif token_type == "ERC721":
+        return TOKEN_STANDARDS["ERC721"]["safeTransferFrom"] + \
+            Web3.to_hex(Web3.to_bytes(hexstr=params["from"]).rjust(32, b'\0'))[2:] + \
+            Web3.to_hex(Web3.to_bytes(hexstr=params["to"]).rjust(32, b'\0'))[2:] + \
+            Web3.to_hex(Web3.to_bytes(params["tokenId"]).rjust(32, b'\0'))[2:]
+    
+    elif token_type == "ERC1155":
+        return TOKEN_STANDARDS["ERC1155"]["safeTransferFrom"] + \
+            Web3.to_hex(Web3.to_bytes(hexstr=params["from"]).rjust(32, b'\0'))[2:] + \
+            Web3.to_hex(Web3.to_bytes(hexstr=params["to"]).rjust(32, b'\0'))[2:] + \
+            Web3.to_hex(Web3.to_bytes(params["tokenId"]).rjust(32, b'\0'))[2:] + \
+            Web3.to_hex(Web3.to_bytes(params["amount"]).rjust(32, b'\0'))[2:] + \
+            "0000000000000000000000000000000000000000000000000000000000000000"  # data
+    
+    raise ValueError("Unsupported token type")
+
+# ======================
+# MAIN LOGIC
+# ======================
+def rescue_assets(network, token_type, token_params):
+    # Initialize Web3 and accounts
+    w3, config = setup_web3(network)
+    sponsor = Account.from_key(os.getenv("SPONSOR_KEY"))
+    compromised = Account.from_key(os.getenv("COMPROMISED_KEY"))
+    
+    # Build transactions
+    transactions = []
+    
+    # Add ETH funding if needed
+    if config["eip1559"]:
+        base_fee = w3.eth.get_block("latest")["baseFeePerGas"]
+        max_priority = Web3.to_wei(2, "gwei")
+        max_fee = base_fee + max_priority
+        gas_params = {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": max_priority}
+    else:
+        gas_params = {"gasPrice": w3.eth.gas_price}
+    
+    transactions.append({
+        "from": sponsor.address,
+        "to": compromised.address,
+        "value": w3.to_wei(0.01, "ether"),
+        **gas_params
+    })
+    
+    # Add asset transfer
+    transfer_data = generate_transfer_data(token_type, token_params)
+    transactions.append({
+        "from": compromised.address,
+        "to": token_params.get("contract_address", token_params["to"]),
+        "data": transfer_data,
+        **gas_params
+    })
+    
+    # Sign and send bundle
+    signed_bundle = flashbot.sign_bundle(transactions)
+    
+    try:
+        simulation = flashbot.simulate(signed_bundle, block_tag="latest")
+        if simulation["firstRevert"]:
+            raise Exception(f"Simulation failed: {simulation['firstRevert']}")
+        
+        tx_hash = flashbot.send_bundle(signed_bundle)
+        return tx_hash
+    
+    except exceptions.SolidityError as e:
+        print(f"Execution reverted: {e}")
+    except ValueError as e:
+        print(f"Validation error: {e}")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+
+# Example usage
+if __name__ == "__main__":
+    # Set environment variables
+    os.environ.update({
+        "ETH_RPC_URL": "YOUR_ETH_RPC",
+        "SPONSOR_KEY": "YOUR_KEY",
+        "COMPROMISED_KEY": "OTHER_KEY"
+    })
+    
+    # ERC20 Example
+    rescue_assets("ethereum", "ERC20", {
+        "to": "0xRecoveryAddress",
+        "amount": 1000000,  # In token units
+        "contract_address": "0xTokenContract"
+    })
+    
+    # NFT Example
+    rescue_assets("polygon", "ERC721", {
+        "from": "0xCompromisedAddress",
+        "to": "0xRecoveryAddress",
+        "tokenId": 1234,
+        "contract_address": "0xNFTContract"
+    })
